@@ -757,7 +757,7 @@ export async function importLysFile(
     }
   }
 
-  const finalMeshModifiers = LysConverter.convertHollowing(sceneDataForConvert, singleGeom, data.geometriesByName);
+  const finalMeshModifiers = LysConverter.convertHollowing(sceneDataForConvert, singleGeom, data.geometriesByName, data.isLegacyGeometry);
   console.log('[lys-import][debug] single-model meshModifiers:', finalMeshModifiers ? `hollowing=${!!finalMeshModifiers.hollowing} holes=${finalMeshModifiers.holePunches?.length ?? 0}` : 'undefined');
 
   // ── Physically hollow the geometry when the Rust backend is available ──

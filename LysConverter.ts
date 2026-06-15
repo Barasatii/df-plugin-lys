@@ -364,6 +364,7 @@ export class LysConverter {
     sceneData: any,
     geometry?: THREE.BufferGeometry,
     geometriesByName?: Map<string, THREE.BufferGeometry>,
+    isLegacyGeometry?: boolean,
   ): ModelMeshModifiers | undefined {
     if (!sceneData) {
       console.log('[LysConverter][convertHollowing] No sceneData — skipping');
@@ -390,7 +391,8 @@ export class LysConverter {
         const objAny = obj as any;
         if (objAny?.hollowing) {
           console.log(`[LysConverter][convertHollowing] Object ${objId} has hollowing: enabled=${objAny.hollowing.enabled}, outer=${objAny.hollowing.outer}`);
-          if (objAny.hollowing.enabled === true) {
+          if (objAny.hollowing.enabled === true
+              || (isLegacyGeometry && typeof objAny.hollowing.outer === 'number' && objAny.hollowing.outer > 0)) {
             hollowingSource = objAny.hollowing;
             console.log(`[LysConverter][convertHollowing] Using per-object hollowing from ${objId}`);
             break;

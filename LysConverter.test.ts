@@ -1871,6 +1871,7 @@ describe('LysConverter', () => {
     });
 
     it('should transform LYS tip normals by object rotation before solving socket axis', () => {
+
         const NORMAL_ROTATION_DATA = {
             objects: {
                 present: {
@@ -1913,5 +1914,63 @@ describe('LysConverter', () => {
         // The solver may flip sign to point toward the shaft start, so we expect +Y.
         assert.ok(cone.normal.y > 0.9, 'Cone axis should align to transformed tip normal direction (toward +Y)');
         assert.ok(Math.abs(cone.normal.z) < 0.2, 'Cone axis should no longer remain near raw +Z after rotation');
+    });
+});
+
+describe('LysConverter.convertHollowing', () => {
+    function buildHollowingScene(opts: { enabled: boolean; outer: number }): any {
+        return {
+            objects: {
+                present: {
+                    byId: {
+                        o1: {
+                            hollowing: {
+                                enabled: opts.enabled,
+                                outer: opts.outer,
+                                infillInterval: 3.0,
+                                infillEnabled: false,
+                            },
+                        },
+                    },
+                },
+            },
+        };
+    }
+
+    it('enables hollowing for legacy geometry when enabled=false but outer > 0', () => {
+        const result = LysConverter.convertHollowing(
+            buildHollowingScene({ enabled: false, outer: 2.5 }),
+            undefined, undefined, true,
+        );
+        assert.ok(result?.hollowing, 'Expected hollowing modifier to be set for legacy geometry');
+        assert.strictEqual(result!.hollowing!.enabled, true,
+            'Hollowing should be enabled for legacy geometry with outer > 0');
+    });
+
+    it('does not enable hollowing for non-legacy geometry when enabled=false', () => {
+        const result = LysConverter.convertHollowing(
+            buildHollowingScene({ enabled: false, outer: 2.5 }),
+            undefined, undefined, false,
+        );
+        assert.strictEqual(result?.hollowing, undefined,
+            'Hollowing should not be set for non-legacy geometry when enabled=false');
+    });
+
+    it('does not enable hollowing for legacy geometry when outer is 0', () => {
+        const result = LysConverter.convertHollowing(
+            buildHollowingScene({ enabled: false, outer: 0 }),
+            undefined, undefined, true,
+        );
+        assert.strictEqual(result?.hollowing, undefined,
+            'Hollowing should not be set for legacy geometry when outer=0');
+    });
+
+    it('enables hollowing when enabled=true regardless of isLegacyGeometry', () => {
+        const result = LysConverter.convertHollowing(
+            buildHollowingScene({ enabled: true, outer: 2.5 }),
+        );
+        assert.ok(result?.hollowing, 'Expected hollowing modifier when enabled=true');
+        assert.strictEqual(result!.hollowing!.enabled, true,
+            'Hollowing modifier should be enabled when sceneData sets enabled=true');
     });
 });

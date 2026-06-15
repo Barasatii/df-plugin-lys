@@ -35,6 +35,8 @@ export interface LysData {
     /** All geometry blobs parsed from the .lys archive, keyed by filename stem (e.g. "o15" for "o15.bin"). */
     geometriesByName: Map<string, THREE.BufferGeometry>;
     sceneData: any; // Decoded MessagePack data
+    /** True when the primary geometry was parsed via the legacy unindexed path (stride-48 binary). */
+    isLegacyGeometry: boolean;
 }
 
 export class LysParser {
@@ -177,19 +179,33 @@ export class LysParser {
 
         let geometry: THREE.BufferGeometry | null = null;
         const geometriesByName = new Map<string, THREE.BufferGeometry>();
+        let isLegacyGeometry = false;
 
         for (const [normalizedStem, candidate] of sortedCandidates) {
+            let parsed: THREE.BufferGeometry | null = null;
+            let parsedAsLegacy = false;
+            const blobBuffer = candidate.blob.slice().buffer;
             try {
-                const parsed = this.parseGeometry(candidate.blob.slice().buffer);
-                if (!geometry) {
-                    geometry = parsed;
-                }
-
-                geometriesByName.set(candidate.stem, parsed);
-                geometriesByName.set(normalizedStem, parsed);
+                parsed = this.parseGeometry(blobBuffer);
             } catch (err) {
                 const reason = err instanceof Error ? err.message : String(err);
-                console.info(`[LysParser] Skipping non-geometry payload "${candidate.stem}": ${reason}`);
+                console.info(`[LysParser] Standard parse failed for "${candidate.stem}": ${reason}`);
+                try {
+                    parsed = this.parseLegacyGeometry(blobBuffer);
+                    parsedAsLegacy = true;
+                    console.info(`[LysParser] Parsed "${candidate.stem}" as legacy unindexed geometry`);
+                } catch (err2) {
+                    const reason2 = err2 instanceof Error ? err2.message : String(err2);
+                    console.info(`[LysParser] Skipping non-geometry payload "${candidate.stem}": ${reason2}`);
+                }
+            }
+            if (parsed) {
+                if (!geometry) {
+                    geometry = parsed;
+                    isLegacyGeometry = parsedAsLegacy;
+                }
+                geometriesByName.set(candidate.stem, parsed);
+                geometriesByName.set(normalizedStem, parsed);
             }
         }
 
@@ -208,7 +224,8 @@ export class LysParser {
         return {
             geometry,
             geometriesByName,
-            sceneData
+            sceneData,
+            isLegacyGeometry,
         };
     }
 
@@ -419,5 +436,183 @@ export class LysParser {
         flatGeometry.computeVertexNormals();
 
         return flatGeometry;
+    }
+
+    /**
+     * Parses legacy pre-v3.1.0 LYS geometry blobs stored as unindexed triangle soup.
+     *
+     * Older Lychee versions used a [V0, V1, V2, Attr] per-triangle layout (stride 48):
+     * three 12-byte XYZ float32 vertex records followed by a 12-byte attribute record
+     * (encodes face normal XY + ancillary data). The attribute must be skipped or the
+     * mesh is filled with enormous elongated triangles stretching to the Z-axis.
+     *
+     * Detection: the attr record always has XY magnitude ≈ 1 mm (< 2 mm), while real
+     * vertex XY magnitudes are >> 5 mm. We probe the first 40 triplets to confirm the
+     * every-4th-triplet pattern before committing to the stride-48 path.
+     */
+    private static parseLegacyGeometry(buffer: ArrayBuffer): THREE.BufferGeometry {
+        const view = new DataView(buffer);
+
+        // --- Step 1: find best starting offset for vertex data ---
+        // Score every plausible offset by how strongly it shows the [V,V,V,Attr]
+        // stride-48 XY pattern (ratio of avgVertXY / avgAttrXY). The true data start
+        // has the highest score because real attr records have XY ≈ 1 mm while vertex
+        // XY is typically >> 5 mm. A wrong offset like H=8 may accidentally pass a
+        // basic float check but will have a much weaker (or zero) score.
+        const candidateOffsets = [0, 4, 8, 9, 10, 11, 12, 16, 20, 24, 28, 32];
+
+        let dataOffset = -1;
+        let bestStrideScore = 0;
+        let firstValidOffset = -1;
+
+        for (const H of candidateOffsets) {
+            if (H >= buffer.byteLength) continue;
+            const n = Math.floor((buffer.byteLength - H) / 12);
+            if (n < 3) continue;
+
+            let valid = true;
+            let hasSignificantCoord = false;
+            for (let i = 0; i < Math.min(10, n); i++) {
+                const off = H + i * 12;
+                const x = view.getFloat32(off, true);
+                const y = view.getFloat32(off + 4, true);
+                const z = view.getFloat32(off + 8, true);
+                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)
+                    || Math.abs(x) > 10_000 || Math.abs(y) > 10_000 || Math.abs(z) > 10_000) {
+                    valid = false;
+                    break;
+                }
+                if (Math.abs(x) > 0.01 || Math.abs(y) > 0.01 || Math.abs(z) > 0.01) {
+                    hasSignificantCoord = true;
+                }
+            }
+            if (!valid || !hasSignificantCoord) continue;
+
+            if (firstValidOffset < 0) firstValidOffset = H;
+
+            const score = this.legacyAttrStrideScore(view, H, buffer.byteLength);
+            if (score > bestStrideScore) {
+                bestStrideScore = score;
+                dataOffset = H;
+            }
+        }
+
+        // If no stride signal found at any offset, fall back to first valid soup offset.
+        if (dataOffset < 0) dataOffset = firstValidOffset;
+        if (dataOffset < 0) {
+            throw new Error('Legacy geometry: no valid XYZ float32 vertex data found at any candidate offset');
+        }
+
+        // --- Step 2: decide path based on score ---
+        // A score ≥ 5 means avgVertXY is at least 5× avgAttrXY — strong enough to
+        // commit to the stride-48 path.
+        const STRIDE_THRESHOLD = 5.0;
+        const useAttrStride = bestStrideScore >= STRIDE_THRESHOLD;
+
+        console.info(`[LysParser] Legacy geometry: dataOffset=${dataOffset}, useAttrStride=${useAttrStride}, strideScore=${bestStrideScore.toFixed(1)}, bufferBytes=${buffer.byteLength}`);
+
+        // --- Step 3: extract position data ---
+        let positions: Float32Array;
+
+        if (useAttrStride) {
+            // Stride-48 path: read [V0, V1, V2] and skip the 12-byte Attr per triangle.
+            const STRIDE = 48;
+            const available = buffer.byteLength - dataOffset;
+            const nWholeTris = Math.floor(available / STRIDE);
+            // A partial last triangle may have [V0, V1, V2] without a trailing Attr.
+            const remainder = available - nWholeTris * STRIDE;
+            const extraVerts = Math.min(3, Math.floor(remainder / 12));
+            // Truncate to a whole number of triangles in case extraVerts leaves a remainder.
+            const rawTotalVerts = nWholeTris * 3 + extraVerts;
+            const totalVerts = Math.floor(rawTotalVerts / 3) * 3;
+
+            if (totalVerts < 3) {
+                throw new Error('Legacy geometry (attr-stride): not enough vertex data');
+            }
+
+            positions = new Float32Array(totalVerts * 3);
+            let idx = 0;
+            const triCount = totalVerts / 3;
+            for (let t = 0; t < Math.min(nWholeTris, triCount); t++) {
+                const tBase = dataOffset + t * STRIDE;
+                const v0 = tBase;
+                const v1 = tBase + 12;
+                const v2 = tBase + 24;
+                // Swap raw X↔Z so geometry matches Lychee's display axes (Z-up, X=width,
+                // Z=height). The permutation (det = -1) also converts CW→CCW winding.
+                // v0
+                positions[idx++] = view.getFloat32(v0 + 8, true);
+                positions[idx++] = view.getFloat32(v0 + 4, true);
+                positions[idx++] = view.getFloat32(v0,     true);
+                // v1
+                positions[idx++] = view.getFloat32(v1 + 8, true);
+                positions[idx++] = view.getFloat32(v1 + 4, true);
+                positions[idx++] = view.getFloat32(v1,     true);
+                // v2
+                positions[idx++] = view.getFloat32(v2 + 8, true);
+                positions[idx++] = view.getFloat32(v2 + 4, true);
+                positions[idx++] = view.getFloat32(v2,     true);
+            }
+            // Extra partial triangle verts (only when triCount > nWholeTris)
+            if (triCount > nWholeTris) {
+                for (let v = 0; v < extraVerts; v++) {
+                    const vBase = dataOffset + nWholeTris * STRIDE + v * 12;
+                    positions[idx++] = view.getFloat32(vBase + 8, true);
+                    positions[idx++] = view.getFloat32(vBase + 4, true);
+                    positions[idx++] = view.getFloat32(vBase,     true);
+                }
+            }
+        } else {
+            // Pure triangle soup: all triplets are vertex positions.
+            const rawNVerts = Math.floor((buffer.byteLength - dataOffset) / 12);
+            // Truncate to a whole number of triangles rather than throwing.
+            const nVerts = Math.floor(rawNVerts / 3) * 3;
+            if (nVerts < 3) {
+                throw new Error('Legacy geometry (soup): not enough vertex data');
+            }
+            positions = new Float32Array(buffer.slice(dataOffset, dataOffset + nVerts * 12));
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.computeVertexNormals();
+        return geometry;
+    }
+
+    /**
+     * Returns a stride-48 signal score for the given offset: the ratio avgVertXY/avgAttrXY
+     * when every 4th triplet (i%4===3) has significantly smaller XY magnitude than the rest.
+     * Returns 0 if the pattern is absent. The correct data-start offset scores highest.
+     */
+    private static legacyAttrStrideScore(view: DataView, dataOffset: number, totalBytes: number): number {
+        const SAMPLE = Math.min(40, Math.floor((totalBytes - dataOffset) / 12));
+        if (SAMPLE < 8) return 0;
+
+        let attrXYSum = 0, attrCount = 0;
+        let vertXYSum = 0, vertCount = 0;
+
+        for (let i = 0; i < SAMPLE; i++) {
+            const off = dataOffset + i * 12;
+            if (off + 12 > totalBytes) break;
+            const x = view.getFloat32(off, true);
+            const y = view.getFloat32(off + 4, true);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return 0;
+            const xyMag = Math.sqrt(x * x + y * y);
+            if (i % 4 === 3) {
+                attrXYSum += xyMag;
+                attrCount++;
+            } else {
+                vertXYSum += xyMag;
+                vertCount++;
+            }
+        }
+
+        if (attrCount === 0 || vertCount === 0) return 0;
+        const avgAttrXY = attrXYSum / attrCount;
+        const avgVertXY = vertXYSum / vertCount;
+        if (avgAttrXY < 2 && avgVertXY > 5 && avgVertXY > avgAttrXY * 5) {
+            return avgVertXY / Math.max(avgAttrXY, 0.001);
+        }
+        return 0;
     }
 }
