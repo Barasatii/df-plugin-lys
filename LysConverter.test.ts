@@ -305,9 +305,9 @@ describe('LysConverter', () => {
         const knot = result.knots.find((k) => k.id === leaf.parentKnotId);
         assert.ok(knot, 'Expected leaf parent knot for leaf-like terminal child');
 
-        // Should stay projected to host (around trunk first-segment start z=2), not preserved at z~0.203.
-        assert.ok(Math.abs((knot?.pos.z ?? 0) - 2) < 1e-3,
-            'Leaf-like terminal base-clamped child should keep projected host knot Z to avoid floating leaf knots');
+        // Segment 0 now extends to root base (Z=0), so Z≈0.203 projects correctly onto the segment.
+        assert.ok(Math.abs((knot?.pos.z ?? 0) - 0.20344101267939063) < 1e-3,
+            'Leaf-like terminal base-clamped child should project to authored Z on extended trunk segment 0');
     });
 
     it('should preserve leaf-like terminal base-clamped authored attach when Z drift is small', () => {
@@ -372,10 +372,12 @@ describe('LysConverter', () => {
         const knot = result.knots.find((k) => k.id === leaf.parentKnotId);
         assert.ok(knot, 'Expected leaf parent knot for leaf-like small-Z-drift child');
 
+        // Segment 0 now extends to root base (Z=0); Z=1.93 is an interior point, so the knot
+        // projects correctly onto the trunk centerline (X=0, Y=0) at the authored Z.
         assert.ok(Math.abs((knot?.pos.z ?? 0) - 1.93) < 1e-6,
-            'Leaf-like base clamp with small Z drift should preserve authored attach Z');
-        assert.ok(Math.abs((knot?.pos.x ?? 0) - 0.9) < 1e-6,
-            'Leaf-like base clamp with small Z drift should preserve authored attach X');
+            'Leaf-like base clamp with small Z drift should project to authored Z on trunk');
+        assert.ok(Math.abs((knot?.pos.x ?? 0) - 0) < 1e-6,
+            'Leaf-like base clamp should project to trunk centerline X (not preserve off-trunk authored X)');
     });
 
     it('should not let explicit endpoint-ordering fallback override deliberate projected base clamp', () => {
@@ -440,9 +442,9 @@ describe('LysConverter', () => {
         const knot = result.knots.find((k) => k.id === leaf.parentKnotId);
         assert.ok(knot, 'Expected leaf parent knot in ordering-guard fixture');
 
-        // Must remain projected to host start, not overridden back to authored base by ordering fallback.
-        assert.ok(Math.abs((knot?.pos.z ?? 0) - 2) < 1e-3,
-            'Endpoint-ordering fallback should not override deliberate projected base clamp knot position');
+        // Segment 0 now extends to root base (Z=0); the knot projects to Z≈0.203 on the extended segment.
+        assert.ok(Math.abs((knot?.pos.z ?? 0) - 0.20344101267939063) < 1e-3,
+            'Endpoint-ordering fallback should not override the correctly projected knot position on extended trunk segment 0');
     });
 
     it('should fall back to parentBaseId/parentTipId host when explicit parentId is stale', () => {

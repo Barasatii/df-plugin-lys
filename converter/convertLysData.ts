@@ -768,12 +768,18 @@ export function convertLysData(data: LysData, settings: SupportSettings, mesh?: 
         transformedTipNormal
       );
 
+      const rootBaseJoint: Joint = {
+        id: uuidv4(),
+        pos: { x: baseRefWorld.x, y: baseRefWorld.y, z: baseRefWorld.z },
+        diameter: getJointDiameter(baseTipSettings?.diameter || pillarDiameter),
+      };
+
       const segments: Segment[] = [];
       segments.push({
         id: uuidv4(),
         type: 'straight',
         diameter: baseTipSettings?.diameter || pillarDiameter,
-        bottomJoint: undefined,
+        bottomJoint: rootBaseJoint,
         topJoint: joint0,
       });
       segments.push({

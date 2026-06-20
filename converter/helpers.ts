@@ -9,7 +9,6 @@ import {
 } from '@/supports/types';
 import type { KickstandBuildResult } from '@/supports/SupportTypes/Kickstand/types';
 import { getFinalSocketPosition } from '@/supports/SupportPrimitives/ContactCone';
-import { findClosestSegment } from '@/supports/SupportPrimitives/Joint/jointUtils';
 import {
   calculateKnotPositionOnSegmentFromT,
 } from '@/supports/SupportPrimitives/Knot/knotUtils';
@@ -530,13 +529,10 @@ function projectPointToTwigHost(
 
 export function projectPointToHost(host: HostEntry, point: THREE.Vector3): { t: number; pointOnLine: Vec3; parentShaftId: string } | null {
   if (host.kind === 'trunk') {
-    const projection = findClosestSegment(host.trunk, host.root, { x: point.x, y: point.y, z: point.z });
-    if (!projection) return null;
-    return {
-      t: projection.t,
-      pointOnLine: projection.pointOnLine,
-      parentShaftId: projection.segment.id,
-    };
+    const candidates = collectHostSegmentProjectionCandidates(host, point);
+    if (candidates.length === 0) return null;
+    const best = candidates.reduce((prev, curr) => curr.distance < prev.distance ? curr : prev);
+    return { t: best.t, pointOnLine: best.pointOnLine, parentShaftId: best.parentShaftId };
   }
 
   if (host.kind === 'branch') {
@@ -642,13 +638,25 @@ function collectHostSegmentProjectionCandidates(
     const segments = host.trunk.segments;
     if (segments.length === 0) return candidates;
 
+    const rootBaseZ = host.root.transform.pos.z;
+    const rootTopZ = rootBaseZ + host.root.diskHeight + host.root.coneHeight;
+    const rootBase: Vec3 = {
+      x: host.root.transform.pos.x,
+      y: host.root.transform.pos.y,
+      z: rootBaseZ,
+    };
     const rootTop: Vec3 = {
       x: host.root.transform.pos.x,
       y: host.root.transform.pos.y,
-      z: host.root.transform.pos.z + host.root.diskHeight + host.root.coneHeight,
+      z: rootTopZ,
     };
 
-    let currentStart: Vec3 = rootTop;
+    // Extend segment 0 down to rootBase only for points in the plate-to-rootTop stub zone.
+    // Points below the plate (z < rootBaseZ) keep the legacy rootTop floor to avoid pulling
+    // knots whose authored Z is meaninglessly negative to Z=0.
+    const inRootStubZone = point.z >= rootBaseZ && point.z < rootTopZ;
+    let currentStart: Vec3 = inRootStubZone ? rootBase : rootTop;
+
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
       const endPos = seg.topJoint?.pos
@@ -919,17 +927,27 @@ function projectPointToHostPreferredSide(
     const segment = segments[targetIndex];
     if (!segment) return null;
 
+    const rootBaseZ = host.root.transform.pos.z;
+    const rootTopZ = rootBaseZ + host.root.diskHeight + host.root.coneHeight;
+    const rootBase: Vec3 = {
+      x: host.root.transform.pos.x,
+      y: host.root.transform.pos.y,
+      z: rootBaseZ,
+    };
     const rootTop: Vec3 = {
       x: host.root.transform.pos.x,
       y: host.root.transform.pos.y,
-      z: host.root.transform.pos.z + host.root.diskHeight + host.root.coneHeight,
+      z: rootTopZ,
     };
 
     const prevSegment = targetIndex > 0 ? segments[targetIndex - 1] : null;
     const prevEnd = prevSegment?.topJoint?.pos
-      ?? (host.trunk.contactCone ? getFinalSocketPosition(host.trunk.contactCone) : rootTop);
+      ?? (host.trunk.contactCone ? getFinalSocketPosition(host.trunk.contactCone) : rootBase);
 
-    const start: Vec3 = targetIndex === 0 ? rootTop : { x: prevEnd.x, y: prevEnd.y, z: prevEnd.z };
+    const inRootStubZone = targetIndex === 0 && point.z >= rootBaseZ && point.z < rootTopZ;
+    const start: Vec3 = targetIndex === 0
+      ? (inRootStubZone ? rootBase : rootTop)
+      : { x: prevEnd.x, y: prevEnd.y, z: prevEnd.z };
     const endPos = segment.topJoint?.pos
       ?? (host.trunk.contactCone ? getFinalSocketPosition(host.trunk.contactCone) : start);
     const end: Vec3 = { x: endPos.x, y: endPos.y, z: endPos.z };
